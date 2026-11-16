@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>备份 / 恢复 · 气象观测数据湖</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="top">
+  <h1>备份 / 恢复</h1>
+  <span class="sub">整湖快照 · 原子切换 · 旧页面与未提交上传过期拒绝</span>
+  <span class="instance">实例 {{ settings.instance_name }} · 快照 v{{ ack }}</span>
+</header>
+
+<main>
+  <div class="crumbs"><a href="/">← 返回数据湖</a></div>
+  {% if msg %}<div class="flash {{ kind }}">{{ msg }}</div>{% endif %}
+
+  <div class="grid">
+    <div>
+      <section class="panel">
+        <h2>
+          下载整湖备份
+          <span class="badge">结构 v{{ ack }}</span>
+          <span class="hint">{{ state.batches|length }} 批</span>
+        </h2>
+        <p class="hint" style="margin-top:-6px">
+          备份在一个已提交读事务中取字段身份、结构与批次清单，并打包全部批次
+          Parquet 原件。打包期间其他实例仍可上传或改列；已进入备份的批次原件
+          本身不可变，因此包内始终是同一次已提交快照。
+        </p>
+        <div class="downloads">
+          <a href="/backup/download">下载备份 ZIP</a>
+          <a href="/api/backup">API 下载</a>
+          <a href="/api/integrity">一致性自检</a>
+        </div>
+
+        <h2 style="margin-top:22px">快照内容</h2>
+        <table class="data">
+          <thead>
+            <tr><th>字段</th><th>field_id（永久身份）</th><th>状态</th></tr>
+          </thead>
+          <tbody>
+          {% for field in state.schema.fields %}
+            <tr>
+              <td><strong>{{ field.name }}</strong></td>
+              <td><code>{{ field.id }}</code></td>
+              <td class="muted">{{ "活动" if field.status == "active" else "已删除" }}</td>
+            </tr>
+          {% endfor %}
+          {% if not state.schema.fields %}
+            <tr><td colspan="3" class="muted">尚无测量列。</td></tr>
+          {% endif %}
+          </tbody>
+        </table>
+
+        <table class="data" style="margin-top:14px">
+          <thead>
+            <tr><th>批次</th><th>原件</th><th>行数</th><th>SHA-256</th></tr>
+          </thead>
+          <tbody>
+          {% for batch in state.batches %}
+            <tr>
+              <td><a href="/batches/{{ batch.id }}"><code>{{ batch.short_id }}</code></a></td>
+              <td class="muted"><code>{{ batch.file_name }}</code></td>
+              <td class="num">{{ batch.row_count }}</td>
+              <td class="muted"><code>{{ batch.file_sha256[:16] }}…</code></td>
+            </tr>
+          {% endfor %}
+          {% if not state.batches %}
+            <tr><td colspan="4" class="muted">尚无批次，备份只含空结构与清单。</td></tr>
+          {% endif %}
+          </tbody>
+        </table>
+      </section>
+
+      <section class="panel">
+        <h2>恢复整湖 <span class="badge gray">原子切换</span></h2>
+        <p class="hint" style="margin-top:-6px">
+          仅接受本服务生成的备份 ZIP。恢复准备期间当前湖仍可读写；校验全部通过
+          后才会整体替换。缺件、SHA-256 不符、路径越界或不是可读原件都会整包拒绝，
+          当前湖保持不变，且不会重新解析 CSV。
+        </p>
+        <form class="stack-form" method="post" action="/backup/restore"
+              enctype="multipart/form-data" id="restore-form"
+              data-confirm="恢复会整体替换当前数据湖：已完成恢复准备后，所有旧页面提交与切换时尚未提交的上传都会过期。继续？">
+          <input type="hidden" name="generation" value="{{ gen }}">
+          <input class="grow" type="file" name="file" accept=".zip,application/zip" required>
+          <button type="submit">校验并整体恢复</button>
+        </form>
+        <div class="notice">
+          切换使代际 +1：即使旧页面携带的结构版本数字与新湖相同，其修改与
+          切换瞬间未提交的上传也会被拒绝，绝不会写入新湖。恢复完成后沿用
+          备份中的字段身份与字段 id，下载规则与恢复前一致。
+        </div>
+      </section>
+    </div>
+
+    <div>
+      <section class="panel">
+        <h2>当前数据湖</h2>
+        <dl class="meta">
+          <dt>结构版本</dt><dd>v{{ ack }}</dd>
+          <dt>代际标识</dt><dd>{{ gen }}</dd>
+          <dt>数据目录</dt><dd>{{ settings.data_dir }}</dd>
+          <dt>控制库</dt><dd>{{ settings.control_db_path }}</dd>
+          <dt>批次数量</dt><dd>{{ state.batches|length }}</dd>
+        </dl>
+      </section>
+
+      <section class="panel">
+        <h2>恢复记录</h2>
+        {% if restores %}
+        <table class="data">
+          <thead>
+            <tr><th>时间 (UTC)</th><th>实例</th><th>新代际</th><th>v</th><th>批次</th></tr>
+          </thead>
+          <tbody>
+          {% for row in restores %}
+            <tr>
+              <td class="num">{{ row.at }}</td>
+              <td>{{ row.instance }}</td>
+              <td class="muted"><code>{{ row.new_generation[:10] }}</code></td>
+              <td class="num">v{{ row.schema_version }}</td>
+              <td class="num">{{ row.batches }}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+        <p class="muted">还没有恢复记录。</p>
+        {% endif %}
+        <div class="downloads"><a href="/api/backup/restores">API 查看恢复记录</a></div>
+      </section>
+
+      <section class="panel">
+        <h2>一致性保证</h2>
+        <ul class="plain">
+          <li>恢复只重放清单中的 field_id、结构与批次登记，不解析 CSV。</li>
+          <li>ZIP 内每个原件都核对长度与 SHA-256；路径必须位于 <code>parquet/</code> 且不越界。</li>
+          <li>新代际先在暂存目录完整落盘并 fsync，随后 rename + 控制指针一次提交。</li>
+          <li>每次查询只绑定一个代际：要么完整旧湖，要么完整新湖。</li>
+          <li>切换 epoch + 1，旧页面与未提交上传按代际拒绝，不依赖版本数字。</li>
+          <li>写盘失败或恢复中退出重启：控制指针仍指向完整旧湖或完整新湖，暂存目录会被清理。</li>
+        </ul>
+      </section>
+    </div>
+  </div>
+</main>
+
+<footer class="foot">
+  实例 {{ settings.instance_name }} · 备份含字段身份、结构与全部批次原件；恢复按代际原子切换。
+</footer>
+<script src="/static/app.js"></script>
+</body>
+</html>

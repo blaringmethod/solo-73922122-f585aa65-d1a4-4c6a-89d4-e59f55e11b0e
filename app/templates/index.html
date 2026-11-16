@@ -51,6 +51,7 @@
                 <div class="row-actions">
                   <form class="inline-form" method="post" action="/fields/{{ field.id }}/rename">
                     <input type="hidden" name="version" value="{{ ack }}">
+          <input type="hidden" name="generation" value="{{ gen }}">
                     <input class="rename" type="text" name="name" value="{{ field.name }}"
                            maxlength="64" required aria-label="新列名">
                     <button class="secondary" type="submit">改名</button>
@@ -58,6 +59,7 @@
                   <form class="inline-form" method="post" action="/fields/{{ field.id }}/delete"
                         data-confirm="删除“{{ field.name }}”后，新同名列为新字段；历史批次该列为空。历史 Parquet 不会重写。继续？">
                     <input type="hidden" name="version" value="{{ ack }}">
+          <input type="hidden" name="generation" value="{{ gen }}">
                     <button class="danger" type="submit">删除</button>
                   </form>
                 </div>
@@ -72,6 +74,7 @@
 
         <form class="stack-form" method="post" action="/fields/add" style="margin-top:14px">
           <input type="hidden" name="version" value="{{ ack }}">
+          <input type="hidden" name="generation" value="{{ gen }}">
           <span class="grow"><input type="text" name="name" placeholder="新增测量列名，如 temp_c"
                                     maxlength="64" required {% if state.schema.active|length >= 8 %}disabled{% endif %}></span>
           <button type="submit" {% if state.schema.active|length >= 8 %}disabled{% endif %}>新增列</button>
@@ -136,6 +139,7 @@
         </p>
         <form class="stack-form" method="post" action="/upload" enctype="multipart/form-data">
           <input type="hidden" name="version" value="{{ ack }}">
+          <input type="hidden" name="generation" value="{{ gen }}">
           <input class="grow" type="file" name="file" accept=".csv,text/csv" required>
           <button type="submit">上传并转换</button>
         </form>
@@ -154,17 +158,18 @@
           <dt>页面快照版本</dt><dd>v{{ ack }}</dd>
           <dt>固定列</dt><dd>station_id, observed_at</dd>
           <dt>数据目录</dt><dd>{{ settings.data_dir }}</dd>
-          <dt>SQLite</dt><dd>{{ settings.db_path }}</dd>
+          <dt>数据湖代际</dt><dd>{{ gen }}</dd>
           <dt>最新已提交</dt><dd>v{{ latest if latest is not none else "?" }}</dd>
         </dl>
         <div class="downloads">
           <a href="/api/state">查看 API 状态</a>
           <a href="/api/integrity">一致性自检</a>
+          <a href="/backup">备份 / 恢复</a>
           <a href="/healthz">健康检查</a>
         </div>
         <div class="notice info">
-          所有新增 / 改名 / 删除 / 上传都携带本页所见的 v{{ ack }}；
-          若已被并发修改，操作整次拒绝并提示刷新，不会覆盖他人变更。
+          所有新增 / 改名 / 删除 / 上传都携带本页所见的 v{{ ack }} 与数据湖代际；
+          若已被并发修改或整湖恢复切换，操作整次拒绝并提示刷新，不会覆盖他人变更。
         </div>
       </section>
 

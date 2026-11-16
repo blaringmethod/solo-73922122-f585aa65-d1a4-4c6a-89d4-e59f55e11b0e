@@ -13,6 +13,7 @@
   <span class="instance">实例 {{ settings.instance_name }} · 快照 v{{ ack }}</span>
 </header>
 
+
 <main>
   <div class="crumbs"><a href="/">← 返回数据湖</a></div>
   {% if msg %}<div class="flash {{ kind }}">{{ msg }}</div>{% endif %}
@@ -32,11 +33,13 @@
       <dt>Parquet</dt><dd>{{ batch.file_name }}</dd>
       <dt>SHA-256</dt><dd>{{ batch.file_sha256 }}</dd>
       <dt>展示快照</dt><dd>v{{ ack }}</dd>
+      <dt>数据湖代际</dt><dd>{{ generation.id }}</dd>
     </dl>
     <div class="downloads">
       <a href="/batches/{{ batch.id }}/download.csv">下载当前列名 CSV</a>
       <a href="/batches/{{ batch.id }}/download.parquet">下载当前列名 Parquet</a>
       <a href="/api/batches/{{ batch.id }}">JSON</a>
+      <a href="/backup">备份 / 恢复</a>
     </div>
   </section>
 

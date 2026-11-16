@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import os
 import socket
 import subprocess
@@ -17,6 +18,7 @@ import sys
 import tempfile
 import threading
 import time
+import zipfile
 from pathlib import Path
 
 import httpx
@@ -216,6 +218,149 @@ def main() -> None:
         check("双实例一致性自检", integrity["ok"] and integrity["batches"] == 2, integrity)
         page = httpx.get(f"{B}/")
         check("网页可打开展示过期提示", page.status_code == 200)
+
+        # 8. 备份：在 B 下载整湖 ZIP，A 仍可继续写入（打包期间不锁湖）
+        backup_resp = httpx.get(f"{B}/backup/download", timeout=60)
+        check("网页可下载整湖备份 ZIP", backup_resp.status_code == 200 and backup_resp.content[:2] == b"PK",
+              len(backup_resp.content))
+        backup = backup_resp.content
+        old_state = httpx.get(f"{A}/api/state").json()
+        old_gen = old_state["generation"]["id"]
+        old_version = old_state["schema"]["schema_version"]
+
+        with zipfile.ZipFile(io.BytesIO(backup)) as archive:
+            manifest = json.loads(archive.read("manifest.json"))
+            member_names = {f["path"] for f in manifest["files"]}
+            check("备份清单列出全部批次原件", member_names == {
+                f"parquet/{b['file_name']}" for b in old_state["batches"]
+            }, sorted(member_names))
+            expected_ids = {
+                f["id"] for f in old_state["schema"]["fields"]
+            } | {f["id"] for f in old_state["schema"]["deleted_fields"]}
+            check("备份保留字段身份（含已删除）",
+                  {f["id"] for f in manifest["fields"]} == expected_ids
+                  and all(f["status"] in ("active", "deleted") for f in manifest["fields"]),
+                  manifest["fields"])
+
+        # 备份之后继续写入：恢复应整体回到备份时点
+        v = httpx.get(f"{A}/api/schema").json()["schema_version"]
+        after_backup = httpx.post(
+            f"{A}/api/batches",
+            data={"version": v},
+            files={"file": ("after.csv", csv_bytes(
+                ["station_id", "observed_at", "humidity"], [["9", "2026-04-01T00:00:00Z", "77"]]
+            ), "text/csv")},
+            timeout=30,
+        )
+        check("备份后仍可继续上传", after_backup.status_code == 201, after_backup.text[:120])
+        after = after_backup.json()
+
+        # 9. 双实例基于同一旧湖同时恢复：至多一份成功
+        restore_results: list[httpx.Response] = []
+
+        def attempt_restore(url: str) -> None:
+            try:
+                restore_results.append(
+                    httpx.post(
+                        f"{url}/api/backup",
+                        data={"generation": old_gen},
+                        files={"file": ("backup.zip", backup, "application/zip")},
+                        timeout=120,
+                    )
+                )
+            except httpx.HTTPError as exc:  # pragma: no cover
+                print(f"恢复请求异常 {url}: {exc}")
+
+        threads = [
+            threading.Thread(target=attempt_restore, args=(A,)),
+            threading.Thread(target=attempt_restore, args=(B,)),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        codes = sorted(r.status_code for r in restore_results)
+        check("双实例同时恢复至多一份成功", codes == [201, 409], codes)
+        winner = next(r for r in restore_results if r.status_code == 201).json()
+        check("恢复后 epoch 前进", winner["epoch"] >= 1, winner)
+        check("恢复代际不同于旧代际", winner["generation"] != old_gen)
+
+        state_b_after = httpx.get(f"{B}/api/state").json()
+        state_a_after = httpx.get(f"{A}/api/state").json()
+        check("两实例看到同一新代际", state_a_after["generation"] == state_b_after["generation"])
+        check("恢复回到备份时点（批次数量）",
+              len(state_a_after["batches"]) == len(old_state["batches"]),
+              [len(state_a_after["batches"]), len(old_state["batches"])])
+        check("恢复结构版本与备份一致",
+              state_a_after["schema"]["schema_version"] == old_version,
+              state_a_after["schema"]["schema_version"])
+        check("备份后新增的批次已被整体替换",
+              httpx.get(f"{A}/api/batches/{after['id']}").status_code == 404)
+        check("恢复后完整性自检通过", httpx.get(f"{B}/api/integrity").json()["ok"])
+
+        # 10. 旧页面（旧代际、版本数字相同）的提交必须过期拒绝
+        v_restored = state_a_after["schema"]["schema_version"]
+        check("恢复后结构版本数字未变（旧页面仍以为有效）", v_restored == old_version)
+        old_field = state_a_after["schema"]["fields"][0]
+        stale_rename = httpx.patch(
+            f"{A}/api/fields/{old_field['id']}",
+            json={"schema_version": v_restored, "name": "hijacked", "generation": old_gen},
+        )
+        check("旧页面改名按代际过期拒绝",
+              stale_rename.status_code == 409 and stale_rename.json()["error"] == "stale_generation",
+              stale_rename.text[:120])
+        stale_upload = httpx.post(
+            f"{B}/api/batches",
+            data={"version": v_restored, "generation": old_gen},
+            files={"file": ("stale.csv", csv_bytes(
+                ["station_id", "observed_at", old_field["name"]], [["1", "2026-05-01T00:00:00Z", "1"]]
+            ), "text/csv")},
+            timeout=30,
+        )
+        check("旧页面/在途上传按代际过期拒绝", stale_upload.status_code == 409, stale_upload.text[:120])
+        post_stale = httpx.get(f"{A}/api/state").json()
+        check("过期写入未进入新湖",
+              post_stale["schema"] == state_a_after["schema"]
+              and [b["id"] for b in post_stale["batches"]] == [b["id"] for b in state_a_after["batches"]])
+
+        # 11. 新代际页面可继续改结构并上传
+        new_gen = state_a_after["generation"]["id"]
+        new_field_resp = httpx.post(
+            f"{A}/api/fields",
+            json={"schema_version": v_restored, "name": "wind_ms", "generation": new_gen},
+        )
+        check("新代际页面可新增列", new_field_resp.status_code == 201, new_field_resp.text[:120])
+        v_new = new_field_resp.json()["schema_version"]
+        new_upload = httpx.post(
+            f"{B}/api/batches",
+            data={"version": v_new, "generation": new_gen},
+            files={"file": ("fresh.csv", csv_bytes(
+                ["station_id", "observed_at", "wind_ms"], [["2", "2026-06-01T00:00:00Z", "3"]]
+            ), "text/csv")},
+            timeout=30,
+        )
+        check("新代际页面可上传", new_upload.status_code == 201, new_upload.text[:160])
+        view = httpx.get(f"{A}/api/batches/{new_upload.json()['id']}?format=csv")
+        check("恢复后下载规则不变（当前列名 CSV）",
+              view.status_code == 200 and view.text.splitlines()[0].endswith("wind_ms"),
+              view.text.splitlines()[0])
+        check("恢复后仍可按当前结构查看旧批次",
+              httpx.get(f"{A}/api/batches/{state_a_after['batches'][0]['id']}").status_code == 200)
+
+        # 12. 损坏包整包拒绝，当前湖不变
+        broken = bytearray(backup)
+        # 翻转 ZIP 中部一个字节（不动中央目录，仅破坏某成员数据）
+        broken[len(broken) // 2] ^= 0xFF
+        bad_resp = httpx.post(
+            f"{A}/api/backup",
+            files={"file": ("broken.zip", bytes(broken), "application/zip")},
+            timeout=60,
+        )
+        check("损坏备份整包拒绝", bad_resp.status_code == 400
+              and bad_resp.json()["error"] == "backup_rejected", bad_resp.text[:160])
+        check("拒绝后当前湖未变",
+              httpx.get(f"{A}/api/state").json()["generation"] == post_stale["generation"])
+
         print("\n全部端到端检查通过。")
     finally:
         for path in stops:
